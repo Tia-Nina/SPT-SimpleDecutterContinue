@@ -9,14 +9,14 @@ using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
 using System.Collections;
-using SimpleDeclutter.Patches;
+using SimpleDeclutterContinue.Patches;
 using Koenigz.PerfectCulling.EFT;
 using BepInEx.Logging;
 using UnityEngine.SceneManagement;
 
-namespace SimpleDeclutter
+namespace SimpleDeclutterContinue
 {
-    [BepInPlugin("somtam.simple.declutter", "Simple Declutter", "1.0.0")]
+    [BepInPlugin("net.ttfl.spt.SimpleDeClutterContinue", "SimpleDeClutterContinue", "1.1.0")]
     public class Plugin : BaseUnityPlugin
     {
         public static ShadowQuality defaultShadows = QualitySettings.shadows;
@@ -25,6 +25,7 @@ namespace SimpleDeclutter
         private static List<GameObject> allGameObjectsList = new List<GameObject>();
         private static List<GameObject> savedClutterObjects = new List<GameObject>();
         internal static bool isOnMap = false;
+
         private void Awake()
         {
             LogSource = Logger;
@@ -34,14 +35,28 @@ namespace SimpleDeclutter
 
             SceneManager.sceneUnloaded += OnSceneUnloaded;
 
-            // Register the SettingChanged event
+            // Register the SettingChanged events
             Settings.declutterEnabledConfig.SettingChanged += OnApplyDeclutterSettingChanged;
             Settings.framesaverPotatoShadow.SettingChanged += OnApplyFrameSaverChanged;
+
+            // Sub-toggles re-apply declutter immediately while in raid
+            foreach (var entry in new[]
+            {
+                Settings.declutterGarbageEnabledConfig,
+                Settings.declutterHeapsEnabledConfig,
+                Settings.declutterSpentCartridgesEnabledConfig,
+                Settings.declutterFakeFoodEnabledConfig,
+                Settings.declutterDecalsEnabledConfig,
+                Settings.declutterPuddlesEnabledConfig,
+                Settings.declutterShardsEnabledConfig,
+            })
+                entry.SettingChanged += OnApplyDeclutterSettingChanged;
 
             new RaidStartPatch().Enable();
 
             InitializeClutterNames();
         }
+
         private void OnApplyDeclutterSettingChanged(object sender, EventArgs e)
         {
             if (isOnMap) ApplyDeclutter();
@@ -50,6 +65,7 @@ namespace SimpleDeclutter
         {
             if (isOnMap) ApplyFrameSavers();
         }
+
         public static void ApplyDeclutter()
         {
             if (Settings.declutterEnabledConfig.Value && EnabledForMap())
@@ -63,7 +79,20 @@ namespace SimpleDeclutter
                 ReClutterEnabled();
             }
 
+            // Toggling decal GameObjects alone is not enough: StaticDeferredDecalRenderer only
+            // redraws from its GPU instance buffers, which the game rebuilds via
+            // UpdateInstancesBuffers() at specific loading points. Rebuild here so decals
+            // disabled/re-enabled mid-raid are actually reflected.
+            RefreshDecalRenderer();
         }
+
+        private static void RefreshDecalRenderer()
+        {
+            var renderer = StaticDeferredDecalRenderer.Instance;
+            if (renderer != null)
+                renderer.UpdateInstancesBuffers();
+        }
+
         public static void ApplyFrameSavers()
         {
             if (Settings.framesaverPotatoShadow.Value && EnabledForMap())
@@ -86,9 +115,16 @@ namespace SimpleDeclutter
         private static bool EnabledForMap()
         {
             // Is declutter enabled for this map?
-            var session = (TarkovApplication)Singleton<ClientApplication<ISession>>.Instance;
-            if (session == null) throw new Exception("No session!");
-            activeRaidSettings = (RaidSettings)(typeof(TarkovApplication).GetField("_raidSettings", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).GetValue(session));
+            // SPT 4.1: ISession was replaced by IEftSession (TarkovApplication : CommonClientApplication<IEftSession>)
+            var session = Singleton<ClientApplication<IEftSession>>.Instance as TarkovApplication;
+            if (session == null)
+            {
+                LogSource.LogWarning("No session - skipping declutter map check");
+                return false;
+            }
+            // SPT 4.1: _raidSettings became public on TarkovApplication - read it via the
+            // public CurrentRaidSettings property instead of reflecting the private field (4.0 style)
+            activeRaidSettings = session.CurrentRaidSettings;
 
             var enabled = false;
             switch (activeRaidSettings?.LocationId)
@@ -115,60 +151,43 @@ namespace SimpleDeclutter
         {
             InitializeClutterNames(); // update values
 
+            // Re-evaluate every saved clutter object so sub-toggle changes can both
+            // hide and restore objects (previously hidden ones must not be skipped)
             foreach (GameObject obj in savedClutterObjects)
             {
-                if (obj.activeSelf == false) continue;
-
-                // if (Settings.declutterUnscrutinizedEnabledConfig.Value == true)
-                // {
-                // obj.SetActive(false);
-                // continue;
-                // }
+                if (obj == null) continue;
 
                 bool foundClutterName = clutterNameDictionary.Keys.Any(key => obj.name.ToLower().Contains(key.ToLower()) && clutterNameDictionary[key]);
-                if (foundClutterName)
-                    obj.SetActive(false);
-                else
-                    obj.SetActive(true);
-
+                obj.SetActive(!foundClutterName);
             }
         }
         private static void ReClutterEnabled()
         {
             foreach (GameObject obj in savedClutterObjects)
             {
+                if (obj == null) continue;
+
                 if (obj.activeSelf == false)
                 {
                     obj.SetActive(true);
                 }
             }
         }
-        internal static IEnumerator GetValidDeclutterTargets()
+        internal static IEnumerator BuildDeclutterListCoroutine()
         {
-            // Loop until the coroutine has finished
-            while (true)
-            {
-                if (allGameObjectsList != null && allGameObjectsList.Count > 0)
-                {
-                    // Coroutine has finished, and allGameObjectsList is populated
-                    GameObject[] allGameObjectsArray = allGameObjectsList.ToArray();
-                    foreach (GameObject obj in allGameObjectsArray)
-                        if (obj != null) ShouldDisableObject(obj);
-                }
-                yield break;
-            }
-        }
-        internal static IEnumerator GetAllGameObjectsInSceneCoroutine()
-        {
+            // Single pass: collect candidate "good" objects from the scene, then validate
+            // each one (name rules, mesh/collider checks) into savedClutterObjects.
             GameObject[] gameObjects = GameObject.FindObjectsOfType<GameObject>();
 
             foreach (GameObject obj in gameObjects)
             {
+                if (obj == null) continue;
+
                 bool isLODGroup = obj.GetComponent<LODGroup>() != null;
                 bool isStaticDeferredDecal = obj.GetComponent<StaticDeferredDecal>() != null;
                 bool isParticleSystem = obj.GetComponent<ParticleSystem>() != null;
-                bool isGoodThing = isLODGroup || isStaticDeferredDecal || isParticleSystem;
 
+                bool isGoodThing;
                 if (Settings.declutterDecalsEnabledConfig.Value)
                 {
                     isGoodThing = isLODGroup || isStaticDeferredDecal;
@@ -210,6 +229,7 @@ namespace SimpleDeclutter
                 if (isGoodThing && !isBadThing)
                 {
                     allGameObjectsList.Add(obj);
+                    ShouldDisableObject(obj);
                 }
             }
             yield break;
@@ -430,23 +450,13 @@ namespace SimpleDeclutter
             bool childHasCollider = false;
             bool foundClutterName = false;
             bool dontDisableName = dontDisableDictionary.Keys.Any(key => obj.name.ToLower().Contains(key.ToLower()));
-            //EFT.UI.ConsoleScreen.LogError("Found Lod Group " + obj.name);
-            // if (declutterUnscrutinizedEnabledConfig.Value == true)
-            // {
-            //     foundClutterName = true;
-            // }
-            // else
-            // {
             foundClutterName = clutterNameDictionary.Keys.Any(key =>
             {
                 return obj.name.ToLower().Contains(key.ToLower());
             });
 
-
-            // }
             if (foundClutterName && !dontDisableName)
             {
-                //EFT.UI.ConsoleScreen.LogError("Found Clutter Name" + obj.name);
                 foreach (Transform child in obj.transform)
                 {
                     childGameMeshObject = child.gameObject;
@@ -527,10 +537,6 @@ namespace SimpleDeclutter
                     return true;
                 }
             }
-            // else
-            // {
-            //     Plugin.LogSource.LogInfo($"NFI Object ${obj.name.ToLower()}");
-            // }
 
             return false;
 

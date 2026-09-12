@@ -3,11 +3,9 @@ using Comfort.Common;
 using EFT;
 using HarmonyLib;
 using System.Reflection;
-using EFT.UI;
 using UnityEngine.SceneManagement;
-using System.IO;
 
-namespace SimpleDeclutter.Patches
+namespace SimpleDeclutterContinue.Patches
 {
     public class RaidStartPatch : ModulePatch
     {
@@ -20,19 +18,27 @@ namespace SimpleDeclutter.Patches
         [PatchPostfix]
         private static void PatchPostfix(GameWorld __instance)
         {
-            var gameWorld = __instance;
-            if (gameWorld == null || gameWorld.MainPlayer == null || IsInHideout()) return;
+            // Never let a mod error end the raid: any exception escaping a postfix on
+            // OnGameStarted is caught by the game and aborts the match back to the menu.
+            try
+            {
+                var gameWorld = __instance;
+                if (gameWorld == null || gameWorld.MainPlayer == null || IsInHideout()) return;
 
-            Plugin.isOnMap = true;
+                Plugin.isOnMap = true;
 
-            Plugin.LogSource.LogInfo($"Plugin run clutter search...");
+                Plugin.LogSource.LogInfo($"Plugin run clutter search...");
 
-            // Build declutter list
-            StaticManager.BeginCoroutine(Plugin.GetAllGameObjectsInSceneCoroutine());
-            StaticManager.BeginCoroutine(Plugin.GetValidDeclutterTargets());
+                // Build declutter list and validate targets in a single coroutine
+                StaticManager.BeginCoroutine(Plugin.BuildDeclutterListCoroutine());
 
-            Plugin.ApplyDeclutter();
-            Plugin.ApplyFrameSavers();
+                Plugin.ApplyDeclutter();
+                Plugin.ApplyFrameSavers();
+            }
+            catch (System.Exception ex)
+            {
+                Plugin.LogSource.LogError($"Declutter failed during raid start (raid continues): {ex}");
+            }
         }
 
         private static bool IsInHideout()
@@ -43,11 +49,9 @@ namespace SimpleDeclutter.Patches
                 Scene scene = SceneManager.GetSceneAt(i);
                 if (scene.name == "bunker_2")
                 {
-                    //EFT.UI.ConsoleScreen.LogError("bunker_2 loaded, not running de-cluttering.");
                     return true;
                 }
             }
-            //EFT.UI.ConsoleScreen.LogError("bunker_2 not loaded, de-cluttering.");
             return false;
         }
     }
